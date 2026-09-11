@@ -889,15 +889,6 @@ class CuzodincaModernDashboard(ctk.CTk):
             ctk.CTkLabel(card_inv_fia, text="• No figura como fiador de terceros.", font=ctk.CTkFont(size=14), text_color=self.c_muted).pack(anchor="w", padx=15, pady=(2, 12))
 
     def _buscar_respaldados(self, cod_socio, nom_socio):
-        """
-        Devuelve la lista de socios deudores a quienes cod_socio/nom_socio respalda
-        como fiador. FIX: antes se usaba "cod_socio in f1" (substring puro), lo que
-        podía dar falsos positivos, por ejemplo el código "20" coincidiendo dentro
-        de "2018-JUAN PEREZ". Ahora se usa una coincidencia con límites de palabra
-        (no debe estar pegado a otro dígito/letra), preservando compatibilidad con
-        campos de fiador en formato libre (heredados del DBF legado) o en formato
-        "CODIGO-NOMBRE" (generado por esta misma aplicación).
-        """
         respaldados = []
         if self.df_maestro is None or self.df_maestro.empty:
             return respaldados
@@ -1002,6 +993,7 @@ class CuzodincaModernDashboard(ctk.CTk):
         # FIX: dict(ops) fallaba porque 'ops' contiene tuplas de 3 elementos
         # (etiqueta, codigo, color), no pares (clave, valor). Esto lanzaba un
         # ValueError a medio renderizar la vista, dejando la pantalla "perdida".
+        # En lugar de dict(ops), usa este diccionario para que no dé ValueError:
         mapa_colores_ops = {val_op: col_op for (_, val_op, col_op) in ops}
         color_borde = mapa_colores_ops.get(self.tipo_op_seleccionada.get(), self.c_primary)
         self.card_p2 = ctk.CTkFrame(self.main_frame, fg_color=self.c_card, corner_radius=10, border_width=2, border_color=color_borde)
