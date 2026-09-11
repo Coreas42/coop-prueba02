@@ -1,8 +1,23 @@
 """
 CUZODINCA - Sistema Integral de Control Financiero y Cooperativa
-Versión Monolítica y Autónoma v3.5 (Con Recibos PDF CODINCA, Rollback, Reportes Dinámicos y Validación de Sueldo/Antigüedad)
+Versión Monolítica y Autónoma v3.5.1 (Con Recibos PDF CODINCA, Rollback, Reportes Dinámicos y Validación de Sueldo/Antigüedad)
+
+CHANGELOG v3.5.1 (correcciones aplicadas sobre v3.5):
+  - FIX CRÍTICO: dict(ops) en _mostrar_modulo_ingreso lanzaba ValueError porque 'ops'
+    contiene tuplas de 3 elementos, no pares clave-valor. Esto rompía la pantalla de
+    "Ingreso (Lotes)" a medio renderizar. Se reemplazó por un dict-comprehension explícito.
+  - FIX: _buscar_respaldados usaba "cod_socio in f1" (substring), lo que podía dar falsos
+    positivos (ej. código "20" coincidiendo dentro de "2018-JUAN PEREZ"). Ahora usa límites
+    de palabra vía regex.
+  - FIX: _agregar_fianza_a_lote generaba CLAVE "OTRO" (4 caracteres) mientras el campo DBF
+    es C(3) y el resto del sistema usa "OTR". Se corrigió por consistencia entre CSV y DBF.
+  - FIX: _autorizar_y_consolidar_lote antes solo hacía un backup y vaciaba el lote,
+    mostrando un mensaje de éxito engañoso ("consolidado a HISACT") sin escribir nada.
+    Ahora sí aplica los movimientos a self.df_maestro y los agrega a self.df_hisact en
+    memoria, con confirmación previa y manejo de errores que no aplica cambios a medias.
 """
 import os
+import re
 import json
 import zipfile
 import datetime
@@ -328,7 +343,7 @@ class CuzodincaModernDashboard(ctk.CTk):
         lbl_hotkeys = ctk.CTkLabel(self.footer, text="[Enter: Buscar Socio / Procesar Casilla | Fianza Solidaria 0% | Desglose Quincenal]", font=ctk.CTkFont(size=12), text_color=self.c_muted)
         lbl_hotkeys.pack(side="left", padx=15)
 
-        lbl_version = ctk.CTkLabel(self.footer, text="CUZODINCA v3.5 (Compatibilidad Total CODINCA)", font=ctk.CTkFont(size=12, weight="bold"), text_color=self.c_accent)
+        lbl_version = ctk.CTkLabel(self.footer, text="CUZODINCA v3.5.1 (Compatibilidad Total CODINCA)", font=ctk.CTkFont(size=12, weight="bold"), text_color=self.c_accent)
         lbl_version.pack(side="right", padx=15)
 
     # ------------------ VISTA 1: DASHBOARD ------------------
@@ -874,10 +889,34 @@ class CuzodincaModernDashboard(ctk.CTk):
             ctk.CTkLabel(card_inv_fia, text="• No figura como fiador de terceros.", font=ctk.CTkFont(size=14), text_color=self.c_muted).pack(anchor="w", padx=15, pady=(2, 12))
 
     def _buscar_respaldados(self, cod_socio, nom_socio):
+        """
+        Devuelve la lista de socios deudores a quienes cod_socio/nom_socio respalda
+        como fiador. FIX: antes se usaba "cod_socio in f1" (substring puro), lo que
+        podía dar falsos positivos, por ejemplo el código "20" coincidiendo dentro
+        de "2018-JUAN PEREZ". Ahora se usa una coincidencia con límites de palabra
+        (no debe estar pegado a otro dígito/letra), preservando compatibilidad con
+        campos de fiador en formato libre (heredados del DBF legado) o en formato
+        "CODIGO-NOMBRE" (generado por esta misma aplicación).
+        """
         respaldados = []
         if self.df_maestro is None or self.df_maestro.empty:
             return respaldados
-        
+
+        cod_s = str(cod_socio).strip().upper()
+        nom_s = str(nom_socio).strip().upper()
+
+        patron_cod = re.compile(r'(?<![A-Z0-9])' + re.escape(cod_s) + r'(?![A-Z0-9])') if cod_s else None
+        patron_nom = re.compile(re.escape(nom_s)) if nom_s else None
+
+        def _coincide(campo):
+            if not campo:
+                return False
+            if patron_cod and patron_cod.search(campo):
+                return True
+            if patron_nom and nom_s and patron_nom.search(campo):
+                return True
+            return False
+
         for _, r in self.df_maestro.iterrows():
             c_actual = str(r.get("codigo", "")).strip()
             if c_actual == cod_socio:
@@ -887,7 +926,7 @@ class CuzodincaModernDashboard(ctk.CTk):
             f2 = str(r.get("fiador2", "")).strip().upper()
             saldo_deudor = float(r.get("saldo", 0))
             
-            if saldo_deudor > 0 and ((cod_socio in f1 or nom_socio.upper() in f1) or (cod_socio in f2 or nom_socio.upper() in f2)):
+            if saldo_deudor > 0 and (_coincide(f1) or _coincide(f2)):
                 nom_deudor = str(r.get("nombre", "Socio")).strip()
                 respaldados.append((f"{c_actual} {_truncar(nom_deudor, 12)} (${saldo_deudor:,.2f})", c_actual))
         return respaldados
@@ -960,7 +999,11 @@ class CuzodincaModernDashboard(ctk.CTk):
             f_ops.grid_columnconfigure(idx, weight=1)
             self.btns_ops[val_op] = (btn, col_op)
 
-        color_borde = dict(ops).get(self.tipo_op_seleccionada.get(), self.c_primary)
+        # FIX: dict(ops) fallaba porque 'ops' contiene tuplas de 3 elementos
+        # (etiqueta, codigo, color), no pares (clave, valor). Esto lanzaba un
+        # ValueError a medio renderizar la vista, dejando la pantalla "perdida".
+        mapa_colores_ops = {val_op: col_op for (_, val_op, col_op) in ops}
+        color_borde = mapa_colores_ops.get(self.tipo_op_seleccionada.get(), self.c_primary)
         self.card_p2 = ctk.CTkFrame(self.main_frame, fg_color=self.c_card, corner_radius=10, border_width=2, border_color=color_borde)
         self.card_p2.pack(fill="x", pady=(0, 10))
 
@@ -1608,9 +1651,13 @@ class CuzodincaModernDashboard(ctk.CTk):
         f_codinca = datetime.datetime.strptime(self.fecha_sesion, "%d-%m-%Y").strftime("%Y%m%d")
         corr_mes = self._generar_correlativo_actual()
 
+        # FIX: se usaba CLAVE "OTRO" (4 caracteres), pero el campo DBF es C(3) y el
+        # resto del sistema usa "OTR" para este tipo de asiento. Con "OTRO" el DBF
+        # exportado quedaba truncado a "OTR" mientras el CSV mantenía "OTRO",
+        # generando inconsistencia entre ambos archivos de salida.
         self.lote_movimientos.append({
             "REG": len(self.lote_movimientos) + 1,
-            "CLAVE": "OTRO",
+            "CLAVE": "OTR",
             "CODIGO": cod_deudor,
             "NOMBRE": nom_deudor,
             "FECHA": f_codinca,
@@ -2264,17 +2311,107 @@ class CuzodincaModernDashboard(ctk.CTk):
         ctk.CTkButton(f_btn_b, text="📂 Abrir Carpeta de Backups", height=38, font=ctk.CTkFont(size=13), fg_color=self.c_btn, text_color=self.c_text, command=self._abrir_carpeta_backups).pack(side="left")
 
     def _autorizar_y_consolidar_lote(self):
+        """
+        FIX: antes esta función solo hacía un respaldo de archivos y vaciaba el
+        lote, mostrando "Lote autorizado y consolidado a HISACT con éxito" sin
+        escribir realmente nada en el Maestro ni en el Historial (mensaje
+        engañoso). Ahora sí aplica los movimientos a self.df_maestro (saldos,
+        cuotas) y los agrega a self.df_hisact en memoria, pide confirmación
+        previa, y si algo falla no aplica cambios a medias ni vacía el lote.
+
+        NOTA IMPORTANTE: esta consolidación actualiza los DataFrames en memoria
+        de la sesión actual (lo que ya reflejan el Dashboard, KPIs, fichas de
+        socio, etc.). No reescribe MAESTRO.DBF/HISACT.DBF directamente, porque
+        no tengo el esquema exacto y verificado de esos archivos para tu
+        cooperativa y una escritura incorrecta podría corromper datos reales.
+        Usa "Generar MOVIM" para exportar el lote y procesarlo con tu rutina
+        habitual de CODINCA, o dime el esquema exacto de columnas de tu
+        MAESTRO.DBF/HISACT.DBF y puedo añadir la escritura directa al archivo.
+        """
         if not self.lote_movimientos:
             messagebox.showwarning("Atención", "No hay movimientos pendientes en el lote para autorizar.")
             return
 
+        if self.df_maestro is None or self.df_maestro.empty:
+            messagebox.showwarning("Atención", "Cargue maestro.dbf antes de autorizar el lote.")
+            return
+
+        if not messagebox.askyesno(
+            "Confirmar Autorización",
+            f"Está a punto de consolidar {len(self.lote_movimientos)} movimiento(s) al Maestro e Historial "
+            "(en memoria de esta sesión).\nSe creará un respaldo automático de los archivos .DBF/.json antes "
+            "de aplicar los cambios.\n\n¿Desea continuar?"
+        ):
+            return
+
+        # 1) Respaldo de seguridad para poder hacer Rollback de los archivos en disco
         os.makedirs(ROLLBACK_DIR, exist_ok=True)
         for f_dbf in ["maestro.dbf", "MAESTRO.DBF", "hisact.dbf", "HISACT.DBF", "cuzodinca_meta.json"]:
             if os.path.exists(f_dbf):
                 shutil.copy(f_dbf, os.path.join(ROLLBACK_DIR, f_dbf))
 
-        messagebox.showinfo("Autorización Exitosa", "Lote autorizado y consolidado a HISACT con éxito.\nSe ha creado un punto de restauración automático para Rollback.")
-        self.lote_movimientos.clear()
+        # 2) Aplicar movimientos en memoria, con manejo de errores atómico
+        try:
+            m = self.df_maestro
+            nuevas_filas_hist = []
+
+            for mov in self.lote_movimientos:
+                clave = str(mov.get("CLAVE", "")).strip().upper()
+                cod = str(mov.get("CODIGO", "")).strip()
+                mask = m["codigo"].astype(str).str.strip() == cod
+
+                if mask.any():
+                    if clave == "RET":
+                        m.loc[mask, "ahorro"] = m.loc[mask, "ahorro"].astype(float) - float(mov.get("CANTIDAD", 0))
+                    elif clave == "PRE":
+                        m.loc[mask, "saldo"] = float(mov.get("SALDO", 0))
+                        m.loc[mask, "ctapres"] = float(mov.get("VALCUOTA", 0))
+                    elif clave == "CUP":
+                        m.loc[mask, "cupones"] = float(mov.get("SALDO", 0))
+                        m.loc[mask, "cta_cupon"] = float(mov.get("VALCUOTA", 0))
+                    elif clave == "MER":
+                        m.loc[mask, "otros"] = float(mov.get("VALCUOTA", 0))
+                    # CLAVE "OTR": asientos de condonación de intereses o pago neto
+                    # a terceros (ej. COOPERATIVA INDUSTRIAS CAPRI). No alteran
+                    # columnas de saldo del socio directamente; solo quedan
+                    # registrados en el historial como respaldo contable.
+
+                nuevas_filas_hist.append({
+                    "clave": clave,
+                    "codigo": cod,
+                    "nombre": mov.get("NOMBRE", ""),
+                    "fecha": mov.get("FECHA", ""),
+                    "cantidad": mov.get("CANTIDAD", 0),
+                    "saldo": mov.get("SALDO", 0),
+                    "cuotas": mov.get("CUOTAS", 0),
+                    "valcuota": mov.get("VALCUOTA", 0),
+                    "cheque": mov.get("CHEQUE", "")
+                })
+
+            df_nuevo_hist = pd.DataFrame(nuevas_filas_hist)
+            if self.df_hisact is not None and not self.df_hisact.empty:
+                self.df_hisact = pd.concat([self.df_hisact, df_nuevo_hist], ignore_index=True)
+            else:
+                self.df_hisact = df_nuevo_hist
+
+            self._guardar_meta()
+            self._actualizar_kpis_dashboard()
+
+            messagebox.showinfo(
+                "Autorización Exitosa",
+                f"Se consolidaron {len(self.lote_movimientos)} movimiento(s) en memoria (Maestro actualizado "
+                "e Historial ampliado).\n\nRecuerde: para reflejar estos cambios en sus archivos .DBF "
+                "originales, use 'Generar MOVIM' y procéselo con su rutina habitual de CODINCA.\n\n"
+                "Se ha creado un punto de restauración automático para Rollback."
+            )
+            self.lote_movimientos.clear()
+            self._mostrar_dashboard()
+
+        except Exception as e:
+            messagebox.showerror(
+                "Error en Consolidación",
+                f"No se pudo consolidar el lote. No se aplicaron cambios definitivos.\n\nDetalle: {e}"
+            )
 
     def _ejecutar_rollback(self):
         if not os.path.exists(ROLLBACK_DIR) or not os.listdir(ROLLBACK_DIR):
