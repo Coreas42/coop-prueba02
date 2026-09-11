@@ -1,20 +1,6 @@
 """
 CUZODINCA - Sistema Integral de Control Financiero y Cooperativa
-Versión Monolítica y Autónoma v3.5.1 (Con Recibos PDF CODINCA, Rollback, Reportes Dinámicos y Validación de Sueldo/Antigüedad)
-
-CHANGELOG v3.5.1 (correcciones aplicadas sobre v3.5):
-  - FIX CRÍTICO: dict(ops) en _mostrar_modulo_ingreso lanzaba ValueError porque 'ops'
-    contiene tuplas de 3 elementos, no pares clave-valor. Esto rompía la pantalla de
-    "Ingreso (Lotes)" a medio renderizar. Se reemplazó por un dict-comprehension explícito.
-  - FIX: _buscar_respaldados usaba "cod_socio in f1" (substring), lo que podía dar falsos
-    positivos (ej. código "20" coincidiendo dentro de "2018-JUAN PEREZ"). Ahora usa límites
-    de palabra vía regex.
-  - FIX: _agregar_fianza_a_lote generaba CLAVE "OTRO" (4 caracteres) mientras el campo DBF
-    es C(3) y el resto del sistema usa "OTR". Se corrigió por consistencia entre CSV y DBF.
-  - FIX: _autorizar_y_consolidar_lote antes solo hacía un backup y vaciaba el lote,
-    mostrando un mensaje de éxito engañoso ("consolidado a HISACT") sin escribir nada.
-    Ahora sí aplica los movimientos a self.df_maestro y los agrega a self.df_hisact en
-    memoria, con confirmación previa y manejo de errores que no aplica cambios a medias.
+Versión Monolítica y Autónoma v3.6 (Con Recibos PDF CODINCA, Rollback, Reportes Dinámicos y Validación de Sueldo/Antigüedad)
 """
 import os
 import re
@@ -51,6 +37,47 @@ def procesar_planilla_safic(ruta_act, num_plan):
     df = cargar_datos_dbf(ruta_act)
     return df, pd.DataFrame()
 
+def numero_a_letras_codinca(monto):
+    """Convierte un valor monetario a la sintaxis exacta del campo LETRAS de CODINCA."""
+    unidades = ["", "UN", "DOS", "TRES", "CUATRO", "CINCO", "SEIS", "SIETE", "OCHO", "NUEVE"]
+    decenas = ["", "DIEZ", "VEINTE", "TREINTA", "CUARENTA", "CINCUENTA", "SESENTA", "SETENTA", "OCHENTA", "NOVENTA"]
+    especiales_10 = {11: "ONCE", 12: "DOCE", 13: "TRECE", 14: "CATORCE", 15: "QUINCE", 
+                     16: "DIECISEIS", 17: "DIECISIETE", 18: "DIECIOCHO", 19: "DIECINUEVE"}
+    centenas = ["", "CIEN", "DOSCIENTOS", "TRESCIENTOS", "CUATROCIENTOS", "QUINIENTOS", 
+                "SEISCIENTOS", "SETECIENTOS", "OCHOCIENTOS", "NOVECIENTOS"]
+
+    entero = int(monto)
+    if entero == 0:
+        return "CERO DOLARES."
+    if entero == 100:
+        return "CIEN DOLARES."
+
+    partes = []
+    c = entero // 100
+    d = (entero % 100) // 10
+    u = entero % 10
+
+    if c > 0:
+        partes.append(centenas[c] if not (c == 1 and (d > 0 or u > 0)) else "CIENTO")
+    
+    du = entero % 100
+    if du in especiales_10:
+        partes.append(especiales_10[du])
+    else:
+        if d > 0:
+            if d == 2 and u > 0:
+                partes.append(f"VEINTI{unidades[u]}")
+                u = 0
+            elif u > 0:
+                partes.append(f"{decenas[d]} Y {unidades[u]}")
+                u = 0
+            else:
+                partes.append(decenas[d])
+        if u > 0:
+            partes.append(unidades[u])
+
+    return " ".join(partes).strip() + " DOLARES."
+
 
 class CuzodincaModernDashboard(ctk.CTk):
     def __init__(self):
@@ -71,6 +98,7 @@ class CuzodincaModernDashboard(ctk.CTk):
         self.df_maestro = None
         self.df_history = None
         self.df_hisact = None
+        self.df_listado = None
         self.socio_actual = None
         self.lote_movimientos = []
         self.tipo_op_seleccionada = ctk.StringVar(value="RET")
@@ -188,6 +216,34 @@ class CuzodincaModernDashboard(ctk.CTk):
         self.config["ultimo_mes_correlativo"] = datetime.datetime.now().strftime("%m")
         self._guardar_configuracion()
 
+    def _cambiar_correlativo_dialog(self):
+        """Permite editar el número secuencial actual del correlativo en caso de error."""
+        dlg = ctk.CTkInputDialog(
+            text=f"Correlativo actual: {self._generar_correlativo_actual()}\n"
+                 f"Mes en curso: {self.mes_correlativo_actual}\n\n"
+                 f"Ingrese el nuevo NÚMERO SECUENCIAL (ej. 1, 25, 177):",
+            title="Ajustar Correlativo Contable"
+        )
+        val = dlg.get_input()
+        if val:
+            try:
+                nuevo_sec = int(val.strip())
+                if nuevo_sec <= 0:
+                    messagebox.showwarning("Atención", "El correlativo debe ser mayor a cero.")
+                    return
+                self.secuencia_correlativo = nuevo_sec
+                self.config["ultimo_secuencial"] = nuevo_sec
+                self._guardar_configuracion()
+                
+                if hasattr(self, "lbl_info_sesion"):
+                    self.lbl_info_sesion.configure(
+                        text=f"📅 Fecha Sesión: {self.fecha_sesion} | Próx. Asiento: #{self._generar_correlativo_actual()}"
+                    )
+                self._actualizar_franja_ultimo_mov()
+                messagebox.showinfo("Actualizado", f"Próximo correlativo fijado en: #{self._generar_correlativo_actual()}")
+            except ValueError:
+                messagebox.showerror("Error", "Debe ingresar un número entero válido.")
+
     def _validar_reglas_fiador(self, cod_solicitante, cod_fiador, nom_fiador):
         cod_s = str(cod_solicitante).strip().upper()
         cod_f = str(cod_fiador).strip().upper()
@@ -238,6 +294,8 @@ class CuzodincaModernDashboard(ctk.CTk):
             self._mostrar_modulo_utilitarios()
         elif self.vista_actual == "ingreso":
             self._mostrar_modulo_ingreso()
+        elif self.vista_actual == "carga":
+            self._mostrar_modulo_carga()
         else:
             self._mostrar_dashboard()
 
@@ -303,6 +361,7 @@ class CuzodincaModernDashboard(ctk.CTk):
         self._btn_nav("⚡ Planilla Nómina", self._abrir_modal_safic)
         self._btn_nav("⚙️ Utilitarios", self._mostrar_modulo_utilitarios)
         self._btn_nav("📈 Reportes", self._abrir_modal_reportes)
+        self._btn_nav("📁 Carga de Archivos", self._mostrar_modulo_carga)
 
         btn_salir = ctk.CTkButton(
             self.sidebar, 
@@ -343,7 +402,7 @@ class CuzodincaModernDashboard(ctk.CTk):
         lbl_hotkeys = ctk.CTkLabel(self.footer, text="[Enter: Buscar Socio / Procesar Casilla | Fianza Solidaria 0% | Desglose Quincenal]", font=ctk.CTkFont(size=12), text_color=self.c_muted)
         lbl_hotkeys.pack(side="left", padx=15)
 
-        lbl_version = ctk.CTkLabel(self.footer, text="CUZODINCA v3.5.1 (Compatibilidad Total CODINCA)", font=ctk.CTkFont(size=12, weight="bold"), text_color=self.c_accent)
+        lbl_version = ctk.CTkLabel(self.footer, text="CUZODINCA v3.6 (Compatibilidad Total CODINCA)", font=ctk.CTkFont(size=12, weight="bold"), text_color=self.c_accent)
         lbl_version.pack(side="right", padx=15)
 
     # ------------------ VISTA 1: DASHBOARD ------------------
@@ -370,16 +429,6 @@ class CuzodincaModernDashboard(ctk.CTk):
         self.kpi_prestamos_act = self._crear_kpi_card(frame_kpi2, "Préstamos Activos", "0 préstamos", "Cuentas con saldo", 1, comando=lambda: self._ver_detalle_metrica("prestamos_activos"))
         self.kpi_por_vencer = self._crear_kpi_card(frame_kpi2, "Préstamos por Liquidar", "0 cuentas", "≤ 2 cuotas restantes (Ver aquí)", 2, comando=lambda: self._ver_detalle_metrica("por_liquidar"))
         self.kpi_cupones_act = self._crear_kpi_card(frame_kpi2, "Cupones / Mercadería", "0 cuentas", "Cuentas con saldo", 3, comando=lambda: self._ver_detalle_metrica("cupones"))
-
-        frame_actions = ctk.CTkFrame(self.main_frame, fg_color=self.c_card, corner_radius=10)
-        frame_actions.pack(fill="x", pady=(0, 15))
-
-        ctk.CTkLabel(frame_actions, text="Tablas del Sistema:", font=ctk.CTkFont(size=14, weight="bold"), text_color=self.c_muted).pack(side="left", padx=15, pady=12)
-        ctk.CTkButton(frame_actions, text="📂 maestro.dbf", height=34, font=ctk.CTkFont(size=13), fg_color=self.c_btn, text_color=self.c_text, hover_color=self.c_primary, command=self._cargar_maestro_manual).pack(side="left", padx=4, pady=12)
-        ctk.CTkButton(frame_actions, text="📂 history.dbf", height=34, font=ctk.CTkFont(size=13), fg_color=self.c_btn, text_color=self.c_text, hover_color=self.c_primary, command=self._cargar_history_manual).pack(side="left", padx=4, pady=12)
-        ctk.CTkButton(frame_actions, text="📂 hisact.dbf", height=34, font=ctk.CTkFont(size=13), fg_color=self.c_btn, text_color=self.c_text, hover_color=self.c_primary, command=self._cargar_hisact_manual).pack(side="left", padx=4, pady=12)
-
-        ctk.CTkButton(frame_actions, text="⚖️ Pre-Cuadre Contable", height=34, font=ctk.CTkFont(size=13, weight="bold"), fg_color=self.c_accent, text_color="#ffffff", command=self._abrir_modal_precuadre).pack(side="right", padx=15, pady=12)
 
         lbl_sec = ctk.CTkLabel(self.main_frame, text="Últimos Movimientos del Sistema", font=ctk.CTkFont(size=17, weight="bold"), text_color=self.c_text)
         lbl_sec.pack(anchor="w", pady=(5, 10), fill="x")
@@ -951,12 +1000,13 @@ class CuzodincaModernDashboard(ctk.CTk):
             text_color=self.c_text
         ).pack(side="left")
 
-        ctk.CTkLabel(
+        self.lbl_info_sesion = ctk.CTkLabel(
             f_head,
             text=f"📅 Fecha Sesión: {self.fecha_sesion} | Próx. Asiento: #{self._generar_correlativo_actual()}",
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=self.c_accent
-        ).pack(side="right")
+        )
+        self.lbl_info_sesion.pack(side="right")
 
         card_p1 = ctk.CTkFrame(self.main_frame, fg_color=self.c_card, corner_radius=10)
         card_p1.pack(fill="x", pady=(0, 10))
@@ -990,10 +1040,6 @@ class CuzodincaModernDashboard(ctk.CTk):
             f_ops.grid_columnconfigure(idx, weight=1)
             self.btns_ops[val_op] = (btn, col_op)
 
-        # FIX: dict(ops) fallaba porque 'ops' contiene tuplas de 3 elementos
-        # (etiqueta, codigo, color), no pares (clave, valor). Esto lanzaba un
-        # ValueError a medio renderizar la vista, dejando la pantalla "perdida".
-        # En lugar de dict(ops), usa este diccionario para que no dé ValueError:
         mapa_colores_ops = {val_op: col_op for (_, val_op, col_op) in ops}
         color_borde = mapa_colores_ops.get(self.tipo_op_seleccionada.get(), self.c_primary)
         self.card_p2 = ctk.CTkFrame(self.main_frame, fg_color=self.c_card, corner_radius=10, border_width=2, border_color=color_borde)
@@ -1030,7 +1076,7 @@ class CuzodincaModernDashboard(ctk.CTk):
         self.f_dinamico_form = ctk.CTkFrame(self.card_p2, fg_color="transparent")
         self.f_dinamico_form.pack(fill="x", padx=15, pady=(5, 12))
 
-        self.frame_ultimo_mov = ctk.CTkFrame(self.main_frame, fg_color=self.c_card_highlight, corner_radius=8, height=42)
+        self.frame_ultimo_mov = ctk.CTkFrame(self.main_frame, fg_color=self.c_card_highlight, corner_radius=8, height=44)
         self.frame_ultimo_mov.pack(fill="x", pady=(0, 10))
         self.frame_ultimo_mov.pack_propagate(False)
         self._actualizar_franja_ultimo_mov()
@@ -1056,13 +1102,41 @@ class CuzodincaModernDashboard(ctk.CTk):
     def _actualizar_franja_ultimo_mov(self):
         for w in self.frame_ultimo_mov.winfo_children():
             w.destroy()
-        if not self.ultimo_movimiento_registrado:
-            ctk.CTkLabel(self.frame_ultimo_mov, text="ℹ️ Sin movimientos ingresados en la sesión actual.", font=ctk.CTkFont(size=12), text_color=self.c_muted).pack(side="left", padx=15)
-            return
 
-        m = self.ultimo_movimiento_registrado
-        txt = f"✓ ÚLTIMO ASIENTO: [{m.get('CLAVE')}] Reg #{m.get('REG')} | Asiento #{m.get('CUPON_NUM', '')} | {m.get('CODIGO')} - {m.get('NOMBRE')} | Monto: ${m.get('CANTIDAD', 0):,.2f} | Saldo: ${m.get('SALDO', 0):,.2f}"
-        ctk.CTkLabel(self.frame_ultimo_mov, text=txt, font=ctk.CTkFont(size=12, weight="bold"), text_color=self.c_accent).pack(side="left", padx=15)
+        if not self.ultimo_movimiento_registrado:
+            texto_franja = f"ultimo - Sin movimientos | Próximo a generar: #{self._generar_correlativo_actual()}"
+            lbl_color = self.c_muted
+        else:
+            m = self.ultimo_movimiento_registrado
+            correlativo_mov = m.get("CUPON_NUM", "")
+            cod_mov = m.get("CODIGO", "")
+            nom_mov = _truncar(m.get("NOMBRE", ""), 25)
+            monto_mov = f"${float(m.get('CANTIDAD', 0)):,.2f}"
+            saldo_mov = f"${float(m.get('SALDO', 0)):,.2f}"
+
+            texto_franja = f"ultimo - {correlativo_mov} | {cod_mov} | {nom_mov} | {monto_mov} | {saldo_mov}"
+            lbl_color = self.c_accent
+
+        lbl_txt = ctk.CTkLabel(
+            self.frame_ultimo_mov, 
+            text=texto_franja, 
+            font=ctk.CTkFont(size=13, weight="bold"), 
+            text_color=lbl_color
+        )
+        lbl_txt.pack(side="left", padx=15)
+
+        btn_corregir = ctk.CTkButton(
+            self.frame_ultimo_mov,
+            text="✏️ Ajustar Correlativo",
+            width=140,
+            height=26,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color=self.c_btn,
+            hover_color=self.c_primary,
+            text_color=self.c_text,
+            command=self._cambiar_correlativo_dialog
+        )
+        btn_corregir.pack(side="right", padx=10)
 
     def _seleccionar_tipo_operacion(self, tipo):
         self.tipo_op_seleccionada.set(tipo)
@@ -1114,7 +1188,7 @@ class CuzodincaModernDashboard(ctk.CTk):
         nom = str(s.get("nombre", "N/D")).strip()
         ahorro = float(s.get("ahorro", 0))
         saldo = float(s.get("saldo", 0))
-        cupones = float(s.get("cupones", 0))
+        obs_socio = str(s.get("observ", "")).upper()
 
         sueldo_meta = self.meta_data.get("sueldos_ingresos", {}).get(cod, {"sueldo": 600.0, "fecha_entrada": "2022-01-01"})
         sueldo_val = sueldo_meta.get("sueldo", 600.0)
@@ -1124,22 +1198,77 @@ class CuzodincaModernDashboard(ctk.CTk):
         f_info = ctk.CTkFrame(self.f_dinamico_form, fg_color=self.c_bg, corner_radius=8)
         f_info.pack(fill="x", pady=(5, 12))
 
-        ctk.CTkLabel(f_info, text=f"👤 {cod} - {nom} | Sueldo: ${sueldo_val:,.2f}", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text).pack(side="left", padx=15, pady=8)
-        ctk.CTkLabel(f_info, text=f"Ahorro Disp: ${ahorro:,.2f}  |  Saldo Préstamo: ${saldo:,.2f}", font=ctk.CTkFont(size=13), text_color=self.c_accent).pack(side="right", padx=15, pady=8)
+        alerta_nomina = ""
+        if "INCAPACIT" in obs_socio:
+            alerta_nomina = " [⚠️ INCAPACIDAD]"
+        elif "VACAC" in obs_socio:
+            alerta_nomina = " [🏖️ VACACIONES]"
+
+        ctk.CTkLabel(
+            f_info, 
+            text=f"👤 {cod} - {nom}{alerta_nomina}", 
+            font=ctk.CTkFont(size=15, weight="bold"), 
+            text_color=self.c_text if not alerta_nomina else self.c_warning
+        ).pack(side="left", padx=15, pady=10)
+
+        ctk.CTkLabel(
+            f_info, 
+            text=f"Ahorro Disp: ${ahorro:,.2f}   |   Saldo Préstamo: ${saldo:,.2f}", 
+            font=ctk.CTkFont(size=15, weight="bold"), 
+            text_color=self.c_accent
+        ).pack(side="right", padx=15, pady=10)
 
         f_grid = ctk.CTkFrame(self.f_dinamico_form, fg_color="transparent")
         f_grid.pack(fill="x", pady=5)
 
+        def crear_bloque_fiador(parent, etiqueta, row, col_start):
+            ctk.CTkLabel(parent, text=etiqueta, font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_muted).grid(row=row, column=col_start, sticky="w", pady=4)
+            
+            f_fia = ctk.CTkFrame(parent, fg_color="transparent")
+            f_fia.grid(row=row, column=col_start+1, columnspan=2, padx=4, pady=4, sticky="w")
+
+            ent_cod_fia = ctk.CTkEntry(f_fia, placeholder_text="Cód", width=65, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
+            ent_cod_fia.pack(side="left", padx=(0, 4))
+
+            lbl_nom_fia = ctk.CTkLabel(f_fia, text="[Nombre Fiador]", width=160, anchor="w", font=ctk.CTkFont(size=12), text_color=self.c_muted)
+            lbl_nom_fia.pack(side="left", padx=(0, 4))
+
+            lbl_badge_fia = ctk.CTkLabel(f_fia, text="[0/3]", font=ctk.CTkFont(size=11, weight="bold"), text_color=self.c_accent)
+            lbl_badge_fia.pack(side="left")
+
+            def auto_buscar_fiador(*args):
+                q = ent_cod_fia.get().strip().upper()
+                if not q or self.df_maestro is None:
+                    lbl_nom_fia.configure(text="[Nombre Fiador]", text_color=self.c_muted)
+                    lbl_badge_fia.configure(text="[0/3]", text_color=self.c_accent)
+                    return
+                m = self.df_maestro
+                m_cod = m["codigo"].astype(str).str.strip().str.upper()
+                match = m[m_cod == q]
+                if not match.empty:
+                    nom_f = str(match.iloc[0].get("nombre", "")).strip()
+                    lbl_nom_fia.configure(text=_truncar(nom_f, 18), text_color=self.c_text)
+                    respaldados = self._buscar_respaldados(q, nom_f)
+                    n_act = len(respaldados)
+                    color = self.c_danger if n_act >= 3 else (self.c_warning if n_act == 2 else self.c_accent)
+                    lbl_badge_fia.configure(text=f"[{n_act}/3]", text_color=color)
+                else:
+                    lbl_nom_fia.configure(text="No encontrado", text_color=self.c_danger)
+                    lbl_badge_fia.configure(text="")
+
+            ent_cod_fia.bind("<KeyRelease>", auto_buscar_fiador)
+            return ent_cod_fia, lbl_nom_fia
+
         if tipo == "RET":
             ctk.CTkLabel(f_grid, text="Monto a Retirar ($):", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text).grid(row=0, column=0, sticky="w", pady=6)
-            ent_monto = ctk.CTkEntry(f_grid, placeholder_text="0.00", width=190, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
-            ent_monto.grid(row=0, column=1, padx=10, pady=6, sticky="w")
+            ent_monto = ctk.CTkEntry(f_grid, placeholder_text="0.00", width=160, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
+            ent_monto.grid(row=0, column=1, padx=6, pady=6, sticky="w")
             ent_monto.focus_set()
 
-            ctk.CTkLabel(f_grid, text="Concepto:", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text).grid(row=0, column=2, sticky="w", padx=(15, 0), pady=6)
-            ent_con = ctk.CTkEntry(f_grid, width=320, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
+            ctk.CTkLabel(f_grid, text="Concepto:", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text).grid(row=0, column=2, sticky="w", padx=(10, 0), pady=6)
+            ent_con = ctk.CTkEntry(f_grid, width=340, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
             ent_con.insert(0, f"RETIRO DE AHORROS DE {nom}")
-            ent_con.grid(row=0, column=3, padx=10, pady=6, sticky="w")
+            ent_con.grid(row=0, column=3, padx=6, pady=6, sticky="w")
 
             lbl_alerta_ret = ctk.CTkLabel(self.f_dinamico_form, text="", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_danger)
             lbl_alerta_ret.pack(anchor="w", pady=(2, 6))
@@ -1154,187 +1283,95 @@ class CuzodincaModernDashboard(ctk.CTk):
                 command=lambda: self._agregar_retiro_a_lote(cod, nom, ent_monto.get(), ent_con.get(), ahorro, lbl_alerta_ret)
             )
             btn_add.pack(anchor="w", pady=5)
-
-            def validar_monto_inline(*args):
-                try:
-                    val = float(ent_monto.get().strip() or 0)
-                    if val > ahorro:
-                        lbl_alerta_ret.configure(text=f"⚠️ Fondos insuficientes: El monto (${val:,.2f}) supera el ahorro disponible (${ahorro:,.2f}).")
-                        btn_add.configure(state="disabled")
-                    else:
-                        lbl_alerta_ret.configure(text="")
-                        btn_add.configure(state="normal")
-                except Exception:
-                    lbl_alerta_ret.configure(text="")
-                    btn_add.configure(state="normal")
-
-            ent_monto.bind("<KeyRelease>", validar_monto_inline)
             ent_monto.bind("<Return>", lambda e: btn_add.invoke())
 
         elif tipo == "REF":
             prest_orig = self._obtener_prestamo_original(cod)
             orig_monto = prest_orig.get("monto_original", saldo)
             orig_total = prest_orig.get("total_con_intereses", saldo)
-            
             factor_cap = (orig_monto / orig_total) if orig_total > 0 else 0.7622
             cap_neto_ref = round(saldo * factor_cap, 2)
             intereses_condonados = round(saldo - cap_neto_ref, 2)
 
             f_res_ref = ctk.CTkFrame(f_grid, fg_color=self.c_bg, corner_radius=8)
             f_res_ref.grid(row=0, column=0, columnspan=6, sticky="ew", pady=(0, 10))
-            
-            txt_ref_info = (
-                f"Saldo Actual en DBF: ${saldo:,.2f}  |  Intereses Condonados (Pronto Pago): -${intereses_condonados:,.2f}  |  "
-                f"Capital Puro a Liquidar: ${cap_neto_ref:,.2f}"
-            )
-            ctk.CTkLabel(f_res_ref, text=txt_ref_info, font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_warning).pack(padx=10, pady=8)
+            txt_ref_info = f"Saldo DBF: ${saldo:,.2f}  |  Int. Condonados: -${intereses_condonados:,.2f}  |  Capital Neto: ${cap_neto_ref:,.2f}"
+            ctk.CTkLabel(f_res_ref, text=txt_ref_info, font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_warning).pack(padx=10, pady=6)
 
-            ctk.CTkLabel(f_grid, text="Efectivo en Mano ($):", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text).grid(row=1, column=0, sticky="w", pady=6)
-            ent_efectivo = ctk.CTkEntry(f_grid, placeholder_text="0.00", width=140, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
+            ctk.CTkLabel(f_grid, text="Efectivo en Mano ($):", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text).grid(row=1, column=0, sticky="w", pady=4)
+            ent_efectivo = ctk.CTkEntry(f_grid, width=120, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
             ent_efectivo.insert(0, "100.00")
-            ent_efectivo.grid(row=1, column=1, padx=6, pady=6, sticky="w")
+            ent_efectivo.grid(row=1, column=1, padx=4, pady=4, sticky="w")
             ent_efectivo.focus_set()
 
-            tasa_def = self.config.get("tasa_interes_defecto", 2.60)
-            ctk.CTkLabel(f_grid, text="N° de Cuotas:", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text).grid(row=1, column=2, sticky="w", padx=(10, 0), pady=6)
-            ent_cuotas = ctk.CTkEntry(f_grid, placeholder_text="24", width=90, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
+            ctk.CTkLabel(f_grid, text="N° Cuotas:", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text).grid(row=1, column=2, sticky="w", padx=(10, 0), pady=4)
+            ent_cuotas = ctk.CTkEntry(f_grid, width=70, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
             ent_cuotas.insert(0, "24")
-            ent_cuotas.grid(row=1, column=3, padx=6, pady=6, sticky="w")
+            ent_cuotas.grid(row=1, column=3, padx=4, pady=4, sticky="w")
 
-            ctk.CTkLabel(f_grid, text="Tasa Mensual (%):", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text).grid(row=1, column=4, sticky="w", padx=(10, 0), pady=6)
-            ent_tasa = ctk.CTkEntry(f_grid, width=90, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
+            tasa_def = self.config.get("tasa_interes_defecto", 2.60)
+            ctk.CTkLabel(f_grid, text="Tasa Mensual (%):", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text).grid(row=1, column=4, sticky="w", padx=(10, 0), pady=4)
+            ent_tasa = ctk.CTkEntry(f_grid, width=70, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
             ent_tasa.insert(0, f"{tasa_def:.2f}")
-            ent_tasa.grid(row=1, column=5, padx=6, pady=6, sticky="w")
+            ent_tasa.grid(row=1, column=5, padx=4, pady=4, sticky="w")
 
-            ctk.CTkLabel(f_grid, text="Fiador 1 (Opcional):", font=ctk.CTkFont(size=13), text_color=self.c_muted).grid(row=2, column=0, sticky="w", pady=6)
-            ent_fia1 = ctk.CTkEntry(f_grid, placeholder_text="Código-Nombre Fiador 1", width=230, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
-            ent_fia1.grid(row=2, column=1, columnspan=2, padx=6, pady=6, sticky="w")
+            ent_f1, lbl_nf1 = crear_bloque_fiador(f_grid, "Fiador 1:", 2, 0)
+            ent_f2, lbl_nf2 = crear_bloque_fiador(f_grid, "Fiador 2:", 2, 3)
 
-            ctk.CTkLabel(f_grid, text="Fiador 2 (Opcional):", font=ctk.CTkFont(size=13), text_color=self.c_muted).grid(row=2, column=3, sticky="w", padx=(10, 0), pady=6)
-            ent_fia2 = ctk.CTkEntry(f_grid, placeholder_text="Código-Nombre Fiador 2", width=230, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
-            ent_fia2.grid(row=2, column=4, columnspan=2, padx=6, pady=6, sticky="w")
+            lbl_proy_ref = ctk.CTkLabel(self.f_dinamico_form, text="", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_accent)
+            lbl_proy_ref.pack(anchor="w", pady=4)
 
-            lbl_proyeccion_ref = ctk.CTkLabel(self.f_dinamico_form, text="", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_accent)
-            lbl_proyeccion_ref.pack(anchor="w", pady=5)
-
-            def recalcular_proy_ref(*args):
+            def recalcular_ref(*args):
                 try:
                     efec = float(ent_efectivo.get().strip() or 0)
                     c = int(ent_cuotas.get().strip() or 1)
                     t_m = float(ent_tasa.get().strip() or 2.60)
                     tasa_cuota = (t_m / 2.0) / 100.0
-                    
                     nvo_cap = cap_neto_ref + efec
                     nuevos_int = round(nvo_cap * (c * tasa_cuota), 2)
-                    tot_deuda = round(nvo_cap + nuevos_int, 2)
-                    cuo_val = round(tot_deuda / c, 2)
-                    
-                    alerta_liquidez = ""
-                    if cuo_val > (sueldo_val * 0.40):
-                        alerta_liquidez = f" ⚠️ ADVERTENCIA: La cuota (${cuo_val:,.2f}) supera el 40% del sueldo (${sueldo_val * 0.40:,.2f})."
-
-                    lbl_proyeccion_ref.configure(
-                        text=f"Nuevo Capital: ${nvo_cap:,.2f}  |  Interés Nuevo: +${nuevos_int:,.2f}  |  Total a Pagar: ${tot_deuda:,.2f}  |  Cuota ({c} pagos): ${cuo_val:,.2f}{alerta_liquidez}"
-                    )
+                    tot_d = round(nvo_cap + nuevos_int, 2)
+                    cuo_v = round(tot_d / c, 2)
+                    lbl_proy_ref.configure(text=f"Nuevo Capital: ${nvo_cap:,.2f}  |  Saldo Total: ${tot_d:,.2f}  |  Cuota ({c} pagos): ${cuo_v:,.2f}")
                 except Exception:
                     pass
 
-            for ent_w in (ent_efectivo, ent_cuotas, ent_tasa):
-                ent_w.bind("<KeyRelease>", recalcular_proy_ref)
-            recalcular_proy_ref()
+            for w_ent in (ent_efectivo, ent_cuotas, ent_tasa):
+                w_ent.bind("<KeyRelease>", recalcular_ref)
+            recalcular_ref()
 
-            ctk.CTkButton(
-                self.f_dinamico_form,
-                text="➕ Agregar Asiento de Refinanciamiento al Lote",
-                height=36,
-                font=ctk.CTkFont(size=13, weight="bold"),
-                fg_color=self.c_warning,
-                text_color="#000000",
-                command=lambda: self._agregar_refinanciamiento_a_lote(
-                    cod, nom, cap_neto_ref, intereses_condonados, ent_efectivo.get(), ent_cuotas.get(), ent_tasa.get(), ent_fia1.get(), ent_fia2.get()
+            def procesar_ref():
+                f1_str = f"{ent_f1.get().strip().upper()}-'{lbl_nf1.cget('text')}'" if ent_f1.get().strip() else ""
+                f2_str = f"{ent_f2.get().strip().upper()}-'{lbl_nf2.cget('text')}'" if ent_f2.get().strip() else ""
+                self._agregar_refinanciamiento_a_lote(
+                    cod, nom, cap_neto_ref, intereses_condonados, ent_efectivo.get(), ent_cuotas.get(), ent_tasa.get(), f1_str, f2_str
                 )
-            ).pack(anchor="w", pady=5)
 
-        elif tipo == "FIA":
-            fia1_nom = str(s.get("fiadores", "")).strip()
-            fia2_nom = str(s.get("fiador2", "")).strip()
-            
-            factor_cap = 0.7622
-            cap_neto = round(saldo * factor_cap, 2)
-            int_cond = round(saldo - cap_neto, 2)
-
-            f_fia_box = ctk.CTkFrame(f_grid, fg_color=self.c_bg, corner_radius=8)
-            f_fia_box.grid(row=0, column=0, columnspan=6, sticky="ew", pady=(0, 10))
-
-            ctk.CTkLabel(f_fia_box, text=f"Deuda Total: ${saldo:,.2f}  |  Intereses Exonerados: -${int_cond:,.2f}  |  Capital a Repartir: ${cap_neto:,.2f} (0% Interés)", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_danger).pack(padx=10, pady=6)
-
-            ctk.CTkLabel(f_grid, text=f"Fiador 1 ({_truncar(fia1_nom, 20)}):", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text).grid(row=1, column=0, sticky="w", pady=6)
-            ent_f1_monto = ctk.CTkEntry(f_grid, width=130, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
-            ent_f1_monto.insert(0, f"{cap_neto/2:.2f}")
-            ent_f1_monto.grid(row=1, column=1, padx=6, pady=6, sticky="w")
-
-            ctk.CTkLabel(f_grid, text="Cuotas F1:", font=ctk.CTkFont(size=13), text_color=self.c_muted).grid(row=1, column=2, sticky="w", padx=(10, 0), pady=6)
-            ent_f1_cuotas = ctk.CTkEntry(f_grid, width=80, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
-            ent_f1_cuotas.insert(0, "24")
-            ent_f1_cuotas.grid(row=1, column=3, padx=6, pady=6, sticky="w")
-
-            ctk.CTkLabel(f_grid, text=f"Fiador 2 ({_truncar(fia2_nom, 20)}):", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text).grid(row=2, column=0, sticky="w", pady=6)
-            ent_f2_monto = ctk.CTkEntry(f_grid, width=130, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
-            ent_f2_monto.insert(0, f"{cap_neto/2:.2f}")
-            ent_f2_monto.grid(row=2, column=1, padx=6, pady=6, sticky="w")
-
-            ctk.CTkLabel(f_grid, text="Cuotas F2:", font=ctk.CTkFont(size=13), text_color=self.c_muted).grid(row=2, column=2, sticky="w", padx=(10, 0), pady=6)
-            ent_f2_cuotas = ctk.CTkEntry(f_grid, width=80, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
-            ent_f2_cuotas.insert(0, "24")
-            ent_f2_cuotas.grid(row=2, column=3, padx=6, pady=6, sticky="w")
-
-            f_quick_fia = ctk.CTkFrame(self.f_dinamico_form, fg_color="transparent")
-            f_quick_fia.pack(anchor="w", pady=5)
-
-            ctk.CTkButton(f_quick_fia, text="50% / 50%", width=90, height=28, font=ctk.CTkFont(size=12), fg_color=self.c_btn, text_color=self.c_text, command=lambda: (ent_f1_monto.delete(0, 'end'), ent_f1_monto.insert(0, f"{cap_neto/2:.2f}"), ent_f2_monto.delete(0, 'end'), ent_f2_monto.insert(0, f"{cap_neto/2:.2f}"))).pack(side="left", padx=2)
-            ctk.CTkButton(f_quick_fia, text="100% F1", width=90, height=28, font=ctk.CTkFont(size=12), fg_color=self.c_btn, text_color=self.c_text, command=lambda: (ent_f1_monto.delete(0, 'end'), ent_f1_monto.insert(0, f"{cap_neto:.2f}"), ent_f2_monto.delete(0, 'end'), ent_f2_monto.insert(0, "0.00"))).pack(side="left", padx=2)
-            ctk.CTkButton(f_quick_fia, text="100% F2", width=90, height=28, font=ctk.CTkFont(size=12), fg_color=self.c_btn, text_color=self.c_text, command=lambda: (ent_f1_monto.delete(0, 'end'), ent_f1_monto.insert(0, "0.00"), ent_f2_monto.delete(0, 'end'), ent_f2_monto.insert(0, f"{cap_neto:.2f}"))).pack(side="left", padx=2)
-
-            ctk.CTkButton(
-                self.f_dinamico_form,
-                text="➕ Aplicar Fianza Solidaria en Lote",
-                height=36,
-                font=ctk.CTkFont(size=13, weight="bold"),
-                fg_color=self.c_primary,
-                command=lambda: self._agregar_fianza_a_lote(
-                    cod, nom, fia1_nom, ent_f1_monto.get(), ent_f1_cuotas.get(), fia2_nom, ent_f2_monto.get(), ent_f2_cuotas.get(), int_cond, cap_neto
-                )
-            ).pack(anchor="w", pady=5)
+            ctk.CTkButton(self.f_dinamico_form, text="➕ Agregar Refinanciamiento al Lote", height=36, font=ctk.CTkFont(size=13, weight="bold"), fg_color=self.c_warning, text_color="#000000", command=procesar_ref).pack(anchor="w", pady=5)
 
         else:
-            ctk.CTkLabel(f_grid, text="Monto Solicitado ($):", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text).grid(row=0, column=0, sticky="w", pady=6)
-            ent_monto = ctk.CTkEntry(f_grid, placeholder_text="0.00", width=160, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
-            ent_monto.grid(row=0, column=1, padx=6, pady=6, sticky="w")
+            ctk.CTkLabel(f_grid, text="Monto Solicitado ($):", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text).grid(row=0, column=0, sticky="w", pady=4)
+            ent_monto = ctk.CTkEntry(f_grid, placeholder_text="0.00", width=120, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
+            ent_monto.grid(row=0, column=1, padx=4, pady=4, sticky="w")
             ent_monto.focus_set()
 
-            ctk.CTkLabel(f_grid, text="N° de Cuotas:", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text).grid(row=0, column=2, sticky="w", padx=(10, 0), pady=6)
-            ent_cuotas = ctk.CTkEntry(f_grid, placeholder_text="24", width=90, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
+            ctk.CTkLabel(f_grid, text="N° Cuotas:", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text).grid(row=0, column=2, sticky="w", padx=(10, 0), pady=4)
+            ent_cuotas = ctk.CTkEntry(f_grid, placeholder_text="24", width=70, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
             ent_cuotas.insert(0, "24")
-            ent_cuotas.grid(row=0, column=3, padx=6, pady=6, sticky="w")
+            ent_cuotas.grid(row=0, column=3, padx=4, pady=4, sticky="w")
 
             tasa_def = 0.00 if tipo == "MER" else self.config.get("tasa_interes_defecto", 2.60)
-            ctk.CTkLabel(f_grid, text="Tasa Mensual (%):", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text).grid(row=0, column=4, sticky="w", padx=(10, 0), pady=6)
-            ent_tasa = ctk.CTkEntry(f_grid, width=90, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
+            ctk.CTkLabel(f_grid, text="Tasa Mensual (%):", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text).grid(row=0, column=4, sticky="w", padx=(10, 0), pady=4)
+            ent_tasa = ctk.CTkEntry(f_grid, width=70, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
             ent_tasa.insert(0, f"{tasa_def:.2f}")
-            ent_tasa.grid(row=0, column=5, padx=6, pady=6, sticky="w")
+            ent_tasa.grid(row=0, column=5, padx=4, pady=4, sticky="w")
 
-            ctk.CTkLabel(f_grid, text="Fiador 1 (Opcional):", font=ctk.CTkFont(size=13), text_color=self.c_muted).grid(row=1, column=0, sticky="w", pady=6)
-            ent_fia1 = ctk.CTkEntry(f_grid, placeholder_text="Código-Nombre Fiador 1", width=230, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
-            ent_fia1.grid(row=1, column=1, columnspan=2, padx=6, pady=6, sticky="w")
-
-            ctk.CTkLabel(f_grid, text="Fiador 2 (Opcional):", font=ctk.CTkFont(size=13), text_color=self.c_muted).grid(row=1, column=3, sticky="w", padx=(10, 0), pady=6)
-            ent_fia2 = ctk.CTkEntry(f_grid, placeholder_text="Código-Nombre Fiador 2", width=230, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
-            ent_fia2.grid(row=1, column=4, columnspan=2, padx=6, pady=6, sticky="w")
+            ent_fia1, lbl_nf1 = crear_bloque_fiador(f_grid, "Fiador 1:", 1, 0)
+            ent_fia2, lbl_nf2 = crear_bloque_fiador(f_grid, "Fiador 2:", 1, 3)
 
             lbl_alerta_cap = ctk.CTkLabel(self.f_dinamico_form, text="", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_warning)
-            lbl_alerta_cap.pack(anchor="w", pady=(2, 6))
+            lbl_alerta_cap.pack(anchor="w", pady=(2, 4))
 
-            def verificar_liquidez_credito(*args):
+            def verificar_liquidez(*args):
                 try:
                     m = float(ent_monto.get().strip() or 0)
                     c = int(ent_cuotas.get().strip() or 1)
@@ -1342,16 +1379,20 @@ class CuzodincaModernDashboard(ctk.CTk):
                     tasa_cuota = (t_m / 2.0) / 100.0
                     int_gen = m * (c * tasa_cuota)
                     cuo_val = (m + int_gen) / c
-                    
                     if cuo_val > (sueldo_val * 0.40):
-                        lbl_alerta_cap.configure(text=f"⚠️ ADVERTENCIA: La cuota calculada (${cuo_val:,.2f}) supera el 40% del sueldo registrado (${sueldo_val * 0.40:,.2f}).")
+                        lbl_alerta_cap.configure(text=f"⚠️ ADVERTENCIA: La cuota (${cuo_val:,.2f}) supera el 40% del sueldo registrado (${sueldo_val * 0.40:,.2f}).")
                     else:
                         lbl_alerta_cap.configure(text="")
                 except Exception:
-                    lbl_alerta_cap.configure(text="")
+                    pass
 
             for ent_w in (ent_monto, ent_cuotas, ent_tasa):
-                ent_w.bind("<KeyRelease>", verificar_liquidez_credito)
+                ent_w.bind("<KeyRelease>", verificar_liquidez)
+
+            def procesar_credito():
+                f1_str = f"{ent_fia1.get().strip().upper()}-'{lbl_nf1.cget('text')}'" if ent_fia1.get().strip() else ""
+                f2_str = f"{ent_fia2.get().strip().upper()}-'{lbl_nf2.cget('text')}'" if ent_fia2.get().strip() else ""
+                self._agregar_credito_a_lote(cod, nom, tipo, ent_monto.get(), ent_cuotas.get(), ent_tasa.get(), f1_str, f2_str)
 
             btn_add = ctk.CTkButton(
                 self.f_dinamico_form,
@@ -1359,9 +1400,9 @@ class CuzodincaModernDashboard(ctk.CTk):
                 height=36,
                 font=ctk.CTkFont(size=13, weight="bold"),
                 fg_color=self.c_primary,
-                command=lambda: self._agregar_credito_a_lote(cod, nom, tipo, ent_monto.get(), ent_cuotas.get(), ent_tasa.get(), ent_fia1.get(), ent_fia2.get())
+                command=procesar_credito
             )
-            btn_add.pack(anchor="w", pady=10)
+            btn_add.pack(anchor="w", pady=6)
             ent_monto.bind("<Return>", lambda e: btn_add.invoke())
 
     def _obtener_prestamo_original(self, cod):
@@ -1398,6 +1439,8 @@ class CuzodincaModernDashboard(ctk.CTk):
             return
 
         reg_num = len(self.lote_movimientos) + 1
+        concepto_txt = concepto if concepto else f"RETIRO DE AHORROS DE {nom}"
+
         nuevo_mov = {
             "REG": reg_num,
             "CLAVE": "RET",
@@ -1405,9 +1448,9 @@ class CuzodincaModernDashboard(ctk.CTk):
             "NOMBRE": nom,
             "FECHA": datetime.datetime.strptime(self.fecha_sesion, "%d-%m-%Y").strftime("%Y%m%d"),
             "CANTIDAD": monto,
-            "LETRAS": f"{monto:,.2f} DOLARES",
+            "LETRAS": numero_a_letras_codinca(monto),
             "CHEQUE": "",
-            "CONCEPTO": concepto or f"RETIRO DE AHORROS DE {nom}",
+            "CONCEPTO": concepto_txt[:45],
             "SALDO": monto,
             "CUOTAS": 0,
             "VALCUOTA": 0.0,
@@ -1439,10 +1482,12 @@ class CuzodincaModernDashboard(ctk.CTk):
             messagebox.showwarning("Validación", "El monto debe ser mayor a $0.00.")
             return
 
-        if fia1.strip():
-            c_f1 = fia1.split("-")[0].strip()
-            if not self._validar_reglas_fiador(cod, c_f1, fia1):
-                return
+        for fia_val in (fia1, fia2):
+            if fia_val and "-" in fia_val:
+                c_f = fia_val.split("-")[0].strip()
+                n_f = fia_val.split("-")[1].replace("'", "").strip()
+                if not self._validar_reglas_fiador(cod, c_f, n_f):
+                    return
 
         tasa_por_cuota = (tasa_m / 2.0) / 100.0
         intereses = round(monto * (num_cuotas * tasa_por_cuota), 2)
@@ -1463,6 +1508,16 @@ class CuzodincaModernDashboard(ctk.CTk):
 
         reg_num = len(self.lote_movimientos) + 1
         corr_mes = self._generar_correlativo_actual()
+
+        if tipo == "PRE":
+            concepto_txt = f"PRESTAMO PERSONAL A  {nom}"[:45]
+        elif tipo == "CUP":
+            concepto_txt = f"CREDITO CUPONES A  {nom}"[:45]
+        elif tipo == "MER":
+            concepto_txt = f"CREDITO MERCADERIA 0% A  {nom}"[:45]
+        else:
+            concepto_txt = f"CREDITO {tipo} A  {nom}"[:45]
+
         nuevo_mov = {
             "REG": reg_num,
             "CLAVE": tipo,
@@ -1470,9 +1525,9 @@ class CuzodincaModernDashboard(ctk.CTk):
             "NOMBRE": nom,
             "FECHA": datetime.datetime.strptime(self.fecha_sesion, "%d-%m-%Y").strftime("%Y%m%d"),
             "CANTIDAD": monto,
-            "LETRAS": f"{monto:,.2f} DOLARES",
+            "LETRAS": numero_a_letras_codinca(monto),
             "CHEQUE": "",
-            "CONCEPTO": f"PRESTAMO PERSONAL A {nom}" if tipo == "PRE" else f"CREDITO {tipo} A {nom}",
+            "CONCEPTO": concepto_txt,
             "SALDO": total_saldo,
             "CUOTAS": num_cuotas,
             "VALCUOTA": val_cuota,
@@ -1501,10 +1556,12 @@ class CuzodincaModernDashboard(ctk.CTk):
             messagebox.showwarning("Validación", "Revise los valores numéricos ingresados.")
             return
 
-        if fia1.strip():
-            c_f1 = fia1.split("-")[0].strip()
-            if not self._validar_reglas_fiador(cod, c_f1, fia1):
-                return
+        for fia_val in (fia1, fia2):
+            if fia_val and "-" in fia_val:
+                c_f = fia_val.split("-")[0].strip()
+                n_f = fia_val.split("-")[1].replace("'", "").strip()
+                if not self._validar_reglas_fiador(cod, c_f, n_f):
+                    return
 
         cap_neto_total = round(cap_neto_prest + cap_neto_cup, 2)
         nuevo_capital_maestro = round(cap_neto_total + efec, 2)
@@ -1607,9 +1664,9 @@ class CuzodincaModernDashboard(ctk.CTk):
             "NOMBRE": nom,
             "FECHA": f_codinca,
             "CANTIDAD": efec,
-            "LETRAS": f"{efec:,.2f} DOLARES",
+            "LETRAS": numero_a_letras_codinca(efec),
             "CHEQUE": "",
-            "CONCEPTO": f"REFINANCIAMIENTO SALDO A {nom}",
+            "CONCEPTO": f"REFINANCIAMIENTO SALDO A {nom}"[:45],
             "SALDO": saldo_bruto_total,
             "CUOTAS": num_cuotas,
             "VALCUOTA": val_cuota,
@@ -1643,10 +1700,6 @@ class CuzodincaModernDashboard(ctk.CTk):
         f_codinca = datetime.datetime.strptime(self.fecha_sesion, "%d-%m-%Y").strftime("%Y%m%d")
         corr_mes = self._generar_correlativo_actual()
 
-        # FIX: se usaba CLAVE "OTRO" (4 caracteres), pero el campo DBF es C(3) y el
-        # resto del sistema usa "OTR" para este tipo de asiento. Con "OTRO" el DBF
-        # exportado quedaba truncado a "OTR" mientras el CSV mantenía "OTRO",
-        # generando inconsistencia entre ambos archivos de salida.
         self.lote_movimientos.append({
             "REG": len(self.lote_movimientos) + 1,
             "CLAVE": "OTR",
@@ -1675,9 +1728,9 @@ class CuzodincaModernDashboard(ctk.CTk):
                 "NOMBRE": fia1.split("-")[1].strip() if "-" in fia1 else fia1,
                 "FECHA": f_codinca,
                 "CANTIDAD": m1,
-                "LETRAS": f"{m1:,.2f} DOLARES",
+                "LETRAS": numero_a_letras_codinca(m1),
                 "CHEQUE": "",
-                "CONCEPTO": f"COBRO FIANZA SOLIDARIA DEUDOR {cod_deudor}",
+                "CONCEPTO": f"COBRO FIANZA SOLIDARIA DEUDOR {cod_deudor}"[:45],
                 "SALDO": m1,
                 "CUOTAS": c1,
                 "VALCUOTA": val_c1,
@@ -1696,9 +1749,9 @@ class CuzodincaModernDashboard(ctk.CTk):
                 "NOMBRE": fia2.split("-")[1].strip() if "-" in fia2 else fia2,
                 "FECHA": f_codinca,
                 "CANTIDAD": m2,
-                "LETRAS": f"{m2:,.2f} DOLARES",
+                "LETRAS": numero_a_letras_codinca(m2),
                 "CHEQUE": "",
-                "CONCEPTO": f"COBRO FIANZA SOLIDARIA DEUDOR {cod_deudor}",
+                "CONCEPTO": f"COBRO FIANZA SOLIDARIA DEUDOR {cod_deudor}"[:45],
                 "SALDO": m2,
                 "CUOTAS": c2,
                 "VALCUOTA": val_c2,
@@ -1889,7 +1942,7 @@ class CuzodincaModernDashboard(ctk.CTk):
             btn.grid(row=0, column=4, padx=8)
             rf.grid_columnconfigure(4, weight=1)
 
-    # ------------------ VISTA 4: MÓDULO SIMULADOR (GRID ORDENADO Y TASA 2.60%) ------------------
+    # ------------------ VISTA 4: MÓDULO SIMULADOR ------------------
     def _mostrar_modulo_simulador(self):
         self.vista_actual = "simulador"
         for widget in self.main_frame.winfo_children():
@@ -1954,7 +2007,6 @@ class CuzodincaModernDashboard(ctk.CTk):
         grid_res_ref = ctk.CTkFrame(t_refinanc, fg_color="transparent")
         grid_res_ref.pack(fill="x", padx=20, pady=15)
         grid_res_ref.grid_columnconfigure((0, 1), weight=1)
-        grid_res_ref.grid_rowconfigure((0, 1), weight=1)
 
         def crear_tarjeta_grid(parent, row, col, titulo, valor_init, color_val):
             c_card_box = ctk.CTkFrame(parent, fg_color=self.c_bg, corner_radius=10)
@@ -1966,8 +2018,9 @@ class CuzodincaModernDashboard(ctk.CTk):
 
         lbl_grid_cap_ant = crear_tarjeta_grid(grid_res_ref, 0, 0, "Capital Consolidado Anterior", "$ 0.00", self.c_text)
         lbl_grid_int_cond = crear_tarjeta_grid(grid_res_ref, 0, 1, "🎉 Intereses Condonados (Pronto Pago)", "$ 0.00", self.c_accent)
-        lbl_grid_nvo_cap = crear_tarjeta_grid(grid_res_ref, 1, 0, "Nuevo Capital + Efectivo", "$ 0.00", self.c_text)
-        lbl_grid_cuota_fin = crear_tarjeta_grid(grid_res_ref, 1, 1, "Nueva Cuota Mensual Calculada", "$ 0.00", self.c_primary)
+        lbl_grid_nvo_cap = crear_tarjeta_grid(grid_res_ref, 1, 0, "Nuevo Capital Puro (+ Efectivo)", "$ 0.00", self.c_text)
+        lbl_grid_tot_deuda = crear_tarjeta_grid(grid_res_ref, 1, 1, "Nuevo Préstamo con Intereses (Total a Pagar)", "$ 0.00", self.c_warning)
+        lbl_grid_cuota_fin = crear_tarjeta_grid(grid_res_ref, 2, 0, "Nueva Cuota Mensual Calculada", "$ 0.00", self.c_primary)
 
         datos_sim = {"saldo_p": 0.0, "saldo_c": 0.0, "saldo_m": 0.0, "orig_p": 0.0, "tot_p": 0.0}
 
@@ -2005,6 +2058,7 @@ class CuzodincaModernDashboard(ctk.CTk):
                 lbl_grid_cap_ant.configure(text=f"$ {cap_ref:,.2f}")
                 lbl_grid_int_cond.configure(text=f"$ {int_ahorrados:,.2f}")
                 lbl_grid_nvo_cap.configure(text=f"$ {nuevo_cap_tot:,.2f} (+${adicional:,.2f} efec)")
+                lbl_grid_tot_deuda.configure(text=f"$ {total_a_pagar:,.2f} (Total Deuda)")
                 lbl_grid_cuota_fin.configure(text=f"$ {cuota_val:,.2f} ({cuotas} pagos)")
             except Exception:
                 pass
@@ -2303,23 +2357,6 @@ class CuzodincaModernDashboard(ctk.CTk):
         ctk.CTkButton(f_btn_b, text="📂 Abrir Carpeta de Backups", height=38, font=ctk.CTkFont(size=13), fg_color=self.c_btn, text_color=self.c_text, command=self._abrir_carpeta_backups).pack(side="left")
 
     def _autorizar_y_consolidar_lote(self):
-        """
-        FIX: antes esta función solo hacía un respaldo de archivos y vaciaba el
-        lote, mostrando "Lote autorizado y consolidado a HISACT con éxito" sin
-        escribir realmente nada en el Maestro ni en el Historial (mensaje
-        engañoso). Ahora sí aplica los movimientos a self.df_maestro (saldos,
-        cuotas) y los agrega a self.df_hisact en memoria, pide confirmación
-        previa, y si algo falla no aplica cambios a medias ni vacía el lote.
-
-        NOTA IMPORTANTE: esta consolidación actualiza los DataFrames en memoria
-        de la sesión actual (lo que ya reflejan el Dashboard, KPIs, fichas de
-        socio, etc.). No reescribe MAESTRO.DBF/HISACT.DBF directamente, porque
-        no tengo el esquema exacto y verificado de esos archivos para tu
-        cooperativa y una escritura incorrecta podría corromper datos reales.
-        Usa "Generar MOVIM" para exportar el lote y procesarlo con tu rutina
-        habitual de CODINCA, o dime el esquema exacto de columnas de tu
-        MAESTRO.DBF/HISACT.DBF y puedo añadir la escritura directa al archivo.
-        """
         if not self.lote_movimientos:
             messagebox.showwarning("Atención", "No hay movimientos pendientes en el lote para autorizar.")
             return
@@ -2336,13 +2373,11 @@ class CuzodincaModernDashboard(ctk.CTk):
         ):
             return
 
-        # 1) Respaldo de seguridad para poder hacer Rollback de los archivos en disco
         os.makedirs(ROLLBACK_DIR, exist_ok=True)
         for f_dbf in ["maestro.dbf", "MAESTRO.DBF", "hisact.dbf", "HISACT.DBF", "cuzodinca_meta.json"]:
             if os.path.exists(f_dbf):
                 shutil.copy(f_dbf, os.path.join(ROLLBACK_DIR, f_dbf))
 
-        # 2) Aplicar movimientos en memoria, con manejo de errores atómico
         try:
             m = self.df_maestro
             nuevas_filas_hist = []
@@ -2354,7 +2389,7 @@ class CuzodincaModernDashboard(ctk.CTk):
 
                 if mask.any():
                     if clave == "RET":
-                        m.loc[mask, "ahorro"] = m.loc[mask, "ahorro"].astype(float) - float(mov.get("CANTIDAD", 0))
+                        m.loc[mask, "ahorro"] = pd.to_numeric(m.loc[mask, "ahorro"], errors='coerce').fillna(0.0) - float(mov.get("CANTIDAD", 0))
                     elif clave == "PRE":
                         m.loc[mask, "saldo"] = float(mov.get("SALDO", 0))
                         m.loc[mask, "ctapres"] = float(mov.get("VALCUOTA", 0))
@@ -2363,10 +2398,6 @@ class CuzodincaModernDashboard(ctk.CTk):
                         m.loc[mask, "cta_cupon"] = float(mov.get("VALCUOTA", 0))
                     elif clave == "MER":
                         m.loc[mask, "otros"] = float(mov.get("VALCUOTA", 0))
-                    # CLAVE "OTR": asientos de condonación de intereses o pago neto
-                    # a terceros (ej. COOPERATIVA INDUSTRIAS CAPRI). No alteran
-                    # columnas de saldo del socio directamente; solo quedan
-                    # registrados en el historial como respaldo contable.
 
                 nuevas_filas_hist.append({
                     "clave": clave,
@@ -2391,9 +2422,7 @@ class CuzodincaModernDashboard(ctk.CTk):
 
             messagebox.showinfo(
                 "Autorización Exitosa",
-                f"Se consolidaron {len(self.lote_movimientos)} movimiento(s) en memoria (Maestro actualizado "
-                "e Historial ampliado).\n\nRecuerde: para reflejar estos cambios en sus archivos .DBF "
-                "originales, use 'Generar MOVIM' y procéselo con su rutina habitual de CODINCA.\n\n"
+                f"Se consolidaron {len(self.lote_movimientos)} movimiento(s) en memoria.\n"
                 "Se ha creado un punto de restauración automático para Rollback."
             )
             self.lote_movimientos.clear()
@@ -2402,7 +2431,7 @@ class CuzodincaModernDashboard(ctk.CTk):
         except Exception as e:
             messagebox.showerror(
                 "Error en Consolidación",
-                f"No se pudo consolidar el lote. No se aplicaron cambios definitivos.\n\nDetalle: {e}"
+                f"No se pudo consolidar el lote. Detalle: {e}"
             )
 
     def _ejecutar_rollback(self):
@@ -2587,7 +2616,6 @@ class CuzodincaModernDashboard(ctk.CTk):
         t_dinamico = tab_rep.add("📊 Reporte de Nómina Dinámico")
         t_recibo = tab_rep.add("📄 Generar Recibo Individual PDF")
 
-        # Tab 1: Reporte Dinámico
         ctk.CTkLabel(t_dinamico, text="Grupo de Nómina:", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text).pack(anchor="w", padx=15, pady=(15, 5))
         var_grupo_rep = ctk.StringVar(value="Todos (Consolidado General)")
         ctk.CTkOptionMenu(t_dinamico, values=["Todos (Consolidado General)", "Solo Planta (Catorcenal - P)", "Solo Administración (Quincenal - A)"], variable=var_grupo_rep, width=340).pack(anchor="w", padx=15, pady=(0, 10))
@@ -2647,7 +2675,6 @@ class CuzodincaModernDashboard(ctk.CTk):
 
         ctk.CTkButton(t_dinamico, text="📊 Generar y Exportar CSV", height=38, fg_color=self.c_primary, command=exportar_dinamico).pack(fill="x", padx=15, pady=20)
 
-        # Tab 2: Recibo Individual PDF
         ctk.CTkLabel(t_recibo, text="Código del Socio para Recibo Individual:", font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text).pack(anchor="w", padx=15, pady=(15, 5))
         ent_rec_cod = ctk.CTkEntry(t_recibo, placeholder_text="Ej: 2018", width=220, font=ctk.CTkFont(size=13), fg_color=self.c_entry_bg, text_color=self.c_text)
         ent_rec_cod.pack(anchor="w", padx=15, pady=(0, 15))
@@ -2706,6 +2733,135 @@ TOTAL --->            $      {total_desc:8.2f}     "" DEPTO. DE MARCOS.""
                 win.destroy()
 
         ctk.CTkButton(t_recibo, text="📄 Generar Recibo Oficial", height=38, fg_color=self.c_accent, text_color="#ffffff", command=generar_recibo_pdf).pack(anchor="w", padx=15, pady=10)
+
+    # ------------------ VISTA: MÓDULO CARGA DE ARCHIVOS ------------------
+    def _mostrar_modulo_carga(self):
+        """Pantalla centralizada para la carga y administración de tablas del sistema."""
+        self.vista_actual = "carga"
+        for widget in self.main_frame.winfo_children():
+            widget.destroy()
+
+        ctk.CTkLabel(
+            self.main_frame, 
+            text="📁 Centro de Carga y Sincronización de Archivos", 
+            font=ctk.CTkFont(size=19, weight="bold"), 
+            text_color=self.c_text
+        ).pack(anchor="w", pady=(0, 15), fill="x")
+
+        def crear_tarjeta_archivo(titulo, desc, estado_txt, comando_carga):
+            card = ctk.CTkFrame(self.main_frame, fg_color=self.c_card, corner_radius=10)
+            card.pack(fill="x", pady=(0, 10))
+
+            f_izq = ctk.CTkFrame(card, fg_color="transparent")
+            f_izq.pack(side="left", padx=15, pady=12)
+
+            ctk.CTkLabel(f_izq, text=titulo, font=ctk.CTkFont(size=15, weight="bold"), text_color=self.c_text).pack(anchor="w")
+            ctk.CTkLabel(f_izq, text=desc, font=ctk.CTkFont(size=12), text_color=self.c_muted).pack(anchor="w", pady=(2, 0))
+
+            f_der = ctk.CTkFrame(card, fg_color="transparent")
+            f_der.pack(side="right", padx=15, pady=12)
+
+            lbl_est = ctk.CTkLabel(f_der, text=estado_txt, font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_accent)
+            lbl_est.pack(side="left", padx=(0, 15))
+
+            ctk.CTkButton(
+                f_der, 
+                text="📂 Cargar", 
+                width=100, 
+                height=34, 
+                font=ctk.CTkFont(size=12, weight="bold"), 
+                fg_color=self.c_primary, 
+                command=comando_carga
+            ).pack(side="left")
+
+        # 1. MAESTRO.DBF
+        n_m = len(self.df_maestro) if self.df_maestro is not None else 0
+        est_m = f"🟢 Cargado ({n_m} socios)" if n_m > 0 else "⚪ No cargado"
+        crear_tarjeta_archivo(
+            "MAESTRO.DBF", 
+            "Padrón general con saldos, ahorros y cuentas bancarias.", 
+            est_m, 
+            lambda: (self._cargar_maestro_manual(), self._mostrar_modulo_carga())
+        )
+
+        # 2. HISTORY.DBF
+        n_h = len(self.df_history) if self.df_history is not None else 0
+        est_h = f"🟢 Cargado ({n_h} registros)" if n_h > 0 else "⚪ No cargado"
+        crear_tarjeta_archivo(
+            "HISTORY.DBF", 
+            "Historial acumulado de movimientos y catorcenas previas.", 
+            est_h, 
+            lambda: (self._cargar_history_manual(), self._mostrar_modulo_carga())
+        )
+
+        # 3. HISACT.DBF
+        n_ha = len(self.df_hisact) if self.df_hisact is not None else 0
+        est_ha = f"🟢 Cargado ({n_ha} registros)" if n_ha > 0 else "⚪ No cargado"
+        crear_tarjeta_archivo(
+            "HISACT.DBF", 
+            "Historial de movimientos activos del período en curso.", 
+            est_ha, 
+            lambda: (self._cargar_hisact_manual(), self._mostrar_modulo_carga())
+        )
+
+        # 4. LISTADO DE EMPLEADOS
+        n_l = len(self.df_listado) if self.df_listado is not None else 0
+        est_l = f"🟢 Cargado ({n_l} colaboradores)" if n_l > 0 else "⚪ No cargado"
+        crear_tarjeta_archivo(
+            "LISTADO (Base de Datos Empleados)", 
+            "Columnas A-J: Código, Nombre, Ingreso, Dirección, Posición, Depto, Sueldo, Grupo, Estado, Salario.", 
+            est_l, 
+            self._cargar_listado_empleados
+        )
+
+    def _cargar_listado_empleados(self):
+        """Carga el archivo listado (DBF, Excel o CSV) y sincroniza salarios/antigüedad."""
+        ruta = filedialog.askopenfilename(
+            title="Seleccionar archivo listado de empleados",
+            filetypes=[("Archivos admitidos", "*.dbf;*.xlsx;*.xls;*.csv"), ("Todos", "*.*")]
+        )
+        if not ruta:
+            return
+
+        try:
+            if ruta.lower().endswith(".dbf"):
+                df = cargar_datos_dbf(ruta)
+            elif ruta.lower().endswith((".xlsx", ".xls")):
+                df = pd.read_excel(ruta)
+            else:
+                df = pd.read_csv(ruta)
+
+            cols_ordenadas = [
+                "codigo", "nombre", "fecha_ingreso", "direccion", "posicion", 
+                "departamento", "tipo_sueldo", "grupo", "estado", "salario"
+            ]
+            if len(df.columns) >= len(cols_ordenadas):
+                mapeo = {df.columns[i]: cols_ordenadas[i] for i in range(len(cols_ordenadas))}
+                df = df.rename(columns=mapeo)
+            else:
+                df.columns = [c.lower() for c in df.columns]
+
+            if "sueldos_ingresos" not in self.meta_data:
+                self.meta_data["sueldos_ingresos"] = {}
+
+            actualizados = 0
+            for _, r in df.iterrows():
+                c_soc = str(r.get("codigo", "")).strip().upper()
+                if c_soc:
+                    salario_val = float(pd.to_numeric(r.get("salario", 600.0), errors='coerce') or 600.0)
+                    ingreso_val = str(r.get("fecha_ingreso", "2022-01-01"))[:10]
+                    self.meta_data["sueldos_ingresos"][c_soc] = {
+                        "sueldo": salario_val,
+                        "fecha_entrada": ingreso_val
+                    }
+                    actualizados += 1
+
+            self._guardar_meta()
+            self.df_listado = df
+            messagebox.showinfo("Carga Exitosa", f"Se cargó el listado con {len(df)} registros.\nSe sincronizaron {actualizados} salarios y fechas en el sistema.")
+            self._mostrar_modulo_carga()
+        except Exception as e:
+            messagebox.showerror("Error al Cargar", f"No se pudo procesar el archivo listado:\n{e}")
 
     # ------------------ TABLAS HISTÓRICAS ------------------
     def _render_movimientos_tabla_general(self, parent_frame):
