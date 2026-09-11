@@ -1,9 +1,7 @@
 name: Compilar CUZODINCA Windows
 
 on:
-  push:
-    branches: [ "main", "master" ]
-  workflow_dispatch:
+  workflow_dispatch: # Permite compilar únicamente de forma manual desde la web
 
 jobs:
   build:
