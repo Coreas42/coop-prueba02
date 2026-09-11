@@ -23,7 +23,7 @@ jobs:
 
       - name: Compilar con PyInstaller
         run: |
-          pyinstaller --noconfirm --onedir --windowed --name "CUZODINCA" main.py
+          pyinstaller --noconfirm --onedir --windowed --collect-all customtkinter --name "CUZODINCA" main.py
 
       - name: Empaquetar artefacto
         uses: actions/upload-artifact@v4
