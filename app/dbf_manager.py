@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pandas as pd
 from dbfread import DBF
 
@@ -21,3 +23,31 @@ def exportar_df_a_csv(df, ruta):
 
 def normalizar_codigo(valor):
     return str(valor).strip().upper()
+
+
+def buscar_archivos_dbf(base_dir="."):
+    nombres = [
+        "maestro.dbf",
+        "MAESTRO.DBF",
+        "history.dbf",
+        "HISTORY.DBF",
+        "hisact.dbf",
+        "HISACT.DBF",
+        "movim.dbf",
+        "MOVIM.DBF",
+    ]
+    base = Path(base_dir)
+    encontrados = {}
+    for nombre in nombres:
+        archivo = base / nombre
+        if archivo.exists():
+            encontrados[nombre.lower()] = str(archivo)
+    return encontrados
+
+
+def cargar_archivos_principales(base_dir="."):
+    archivos = buscar_archivos_dbf(base_dir)
+    cargados = {}
+    for clave, ruta in archivos.items():
+        cargados[clave] = cargar_datos_dbf(ruta)
+    return cargados
